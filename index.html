@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>دفتر يومياتي 📓</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>📓 دفتر يومياتي</h1>
+  <div class="top-actions">
+    <button id="btn-theme" title="وضع ليلي / نهاري">🌙</button>
+    <button id="btn-logout" title="خروج (يمسح الدخول المحفوظ من هذا الجهاز)" class="hidden">🚪 خروج</button>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- الدخول بـ PAT فقط — لا كلمة سر، لا تخزين دائم -->
+  <section id="screen-login" class="card hidden">
+    <h2>🔑 الدخول بالـ PAT + كلمة سر التشفير</h2>
+    <p class="muted">الصق PAT بصلاحية <b>Contents: Read and write</b> ثم اختر الريبو من القائمة — بدون كتابة أي اسم يدوياً. الدخول (PAT + كلمة السر) <b>يُحفظ في هذا المتصفح</b> ويبقى بعد إغلاقه.</p>
+    <label>GitHub PAT<input id="in-token" type="password" dir="ltr" placeholder="github_pat_..." autocomplete="off" /></label>
+    <button id="btn-fetch-repos" class="big">📦 عرض مستودعاتي</button>
+    <p class="muted" id="whoami"></p>
+    <label id="repo-wrap" class="hidden">اختر الريبو (فقط ما لديك عليه صلاحية كتابة)
+      <select id="in-repo-select"></select>
+    </label>
+    <label id="branch-wrap" class="hidden">الفرع
+      <select id="in-branch-select"></select>
+    </label>
+    <label id="pwd-wrap" class="hidden">🔐 كلمة سر التشفير (تشفّر كل البيانات: نصوص + صور + فيديو + صوت)
+      <input id="in-pwd" type="password" placeholder="احفظها جيداً — نسيانها = ضياع البيانات" autocomplete="off" />
+    </label>
+    <button id="btn-login" class="primary big hidden">دخول 🔓</button>
+    <p class="warn hidden" id="pwd-warn">⚠️ نفس كلمة السر مطلوبة كل جلسة لفك التشفير. لا تُحفظ في أي مكان دائم، ولا يمكن استرجاع البيانات بدونها.</p>
+    <p id="login-status" class="muted"></p>
+    <ol class="help">
+      <li>أنشئ التوكن: GitHub → Settings → Developer settings → Fine-grained tokens → اختر <b>هذا الريبو فقط</b> → <b>Contents: Read and write</b>.</li>
+      <li>لن تُقبل التوكنات بدون صلاحية كتابة (نرفض الدخول).</li>
+      <li>⚠️ الدخول يُحفظ في <b>localStorage بهذا المتصفح</b> ويبقى بعد الإغلاق — استخدمه على <b>جهازك الخاص فقط</b> (بقفل شاشة)، ولمسحه اضغط <b>خروج</b>.</li>
+      <li>العرض **مصغّرات بدون تحميل**: صور مصغرة وإطارات فيديو والمدة والحجم تُعرض فوراً — الضغط على المصغّر يجمّل **هذا الملف وحده فقط** (كل ملف مخزن مشفراً وحده)، وزر **▶ تحميل الكل** يجمّل مرفقات اليومية دفعة واحدة.</li>
+      <li>🧠 **الذاكرة**: المرفوعات تُزال من الذاكرة فور نجاح الحفظ، والمفتوحة للعرض تُحذف تلقائياً **بعد 24 ساعة** (لا لحظياً) — وكل شيء في RAM فقط ويُمسح كله بالخروج أو إغلاق التبويب.</li>
+      <li>⏳ **الرفع لا يستمر بعد إغلاق المتصفح** (مستحيل تقنياً) — لكن المغادرة أثناء الرفع تُظهر تحذيراً، وانقطاع الرفع لأي سبب ثم ضغط حفظ مجدداً **يُكمل من حيث توقف** (الملفات المرفوعة تُتخطى لا تُعاد).</li>
+      <li>📥 **دون إنترنت**: الحفظ يعمل عادياً — تُحفظ اليومية في **قائمة انتظار على هذا الجهاز** (IndexedDB، وتبقى بعد إغلاق المتصفح) وتُرفع **تلقائياً** عند عودة الاتصال. ملاحظة صدق: ما حُفظ دون تشفير (أول استخدام دون اتصال سابق) يبقى خاماً على جهازك حتى يُرفع.</li>
+      <li>✏️ كل ملف مرفق له **اسم عرض وملاحظة** يُكتبان من صفحة الرفع ويظهران مع المصغّر والعرض الكامل.</li>
+      <li>ملاحظة صدق: ZIP لا يصغّر الصور والفيديو كثيراً (هي مضغوطة أصلاً) — التوفير الحقيقي من ضغط الصور والحزم في ملف واحد. RAR/7z لا يمكن إنشاؤهما داخل المتصفح، وZIP يفتح في كل الأنظمة.</li>
+    </ol>
+  </section>
+
+  <!-- التطبيق (لا يظهر إلا بعد تحقق PAT كتابة) -->
+  <section id="screen-app" class="hidden">
+    <section class="card">
+      <div class="row" style="justify-content:space-between">
+        <span class="muted" id="sess-info"></span>
+        <button id="btn-relogin">🔄 تغيير الريبو / التوكن</button>
+      </div>
+    </section>
+
+    <section id="outbox-card" class="card hidden">
+      <h2>📥 قائمة الانتظار (حُفظت دون إنترنت)</h2>
+      <p class="muted" id="outbox-info"></p>
+      <div id="outbox-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>✍️ يومية جديدة</h2>
+      <div class="grid2">
+        <label>التاريخ<input type="date" id="f-date" /></label>
+        <label>المزاج
+          <select id="f-mood">
+            <option value="">—</option>
+            <option>😊 سعيد</option>
+            <option>😐 عادي</option>
+            <option>😔 حزين</option>
+            <option>🤩 متحمس</option>
+            <option>😴 متعب</option>
+          </select>
+        </label>
+      </div>
+      <label>العنوان<input id="f-title" placeholder="عنوان اليوم..." /></label>
+      <label>ملاحظات<textarea id="f-text" rows="4" placeholder="اكتب يومياتك هنا..."></textarea></label>
+      <label>إرفاق (صور تُضغط تلقائياً • كل ملف يُرفع مشفّراً وحده — فتح صورة لا يحمّل بقية ملفات اليوم)
+        <input type="file" id="f-files" multiple accept="image/*,video/*,audio/*" />
+      </label>
+      <div class="row">
+        <button id="btn-record">🎙️ تسجيل صوت</button>
+        <button id="btn-stop-record" class="hidden" disabled>⏹ إيقاف (<span id="rec-time">0</span>ث)</button>
+        <audio id="rec-preview" controls class="hidden"></audio>
+      </div>
+      <div id="pending-files" class="chips"></div>
+      <button id="btn-save-entry" class="primary big">💾 حفظ اليومية في GitHub</button>
+      <p id="save-status" class="muted"></p>
+    </section>
+
+    <section class="card">
+      <h2>📅 التقويم والبحث</h2>
+      <div class="row">
+        <button id="cal-prev">◀</button>
+        <strong id="cal-title"></strong>
+        <button id="cal-next">▶</button>
+      </div>
+      <div id="calendar" class="calendar"></div>
+      <div class="row">
+        <input id="q-search" placeholder="🔍 ابحث في العنوان أو النص..." style="flex:1" />
+        <input type="date" id="q-date" />
+        <button id="btn-reload">↻ تحديث</button>
+      </div>
+    </section>
+
+    <section id="entries" class="entries"></section>
+  </section>
+</main>
+
+<footer class="footer muted">يعمل على GitHub Pages • PAT + تشفير كامل (حفظ محلي) • <span id="conn-dot">●</span> <span id="conn-text">غير متصل</span></footer>
+
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
