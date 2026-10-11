@@ -238,11 +238,16 @@ async function gh(path, opts = {}) {
   const c = ctx();
   if (!c.owner || !c.repo) throw new Error('بيانات الدخول مفقودة — سجّل الدخول من جديد');
   if (!c.token) throw new Error('لا يوجد PAT محفوظ');
-  const res = await fetch(`https://api.github.com/repos/${c.owner}/${c.repo}/contents/${path}`, {
+  const res = await ghGate(() => fetch(`https://api.github.com/repos/${c.owner}/${c.repo}/contents/${path}`, {
     ...opts,
     headers: { 'Accept': 'application/vnd.github+json', 'Authorization': `Bearer ${c.token}`, 'X-GitHub-Api-Version': '2022-11-28', ...(opts.headers || {}) },
-  });
+  }));
   if (res.status === 401) { logout(); throw new Error('PAT مرفوض — سجّل الدخول من جديد'); }
+  if (res.status === 403 || res.status === 429) {
+    const ra = Math.min(Number(res.headers.get('retry-after') || 0) || 0, 30);
+    ghPause(ra > 0 ? ra * 1000 : 8000);
+    throw new Error(`حد معدّل GitHub مؤقتاً — انتظر قليلاً ثم أعد المحاولة`);
+  }
   if (!res.ok) {
     const t = await res.text();
     throw new Error(`GitHub ${res.status}: ${t.slice(0, 200)}`);
@@ -252,22 +257,38 @@ async function gh(path, opts = {}) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// بوابة واحدة لكل طلبات GitHub: تفرض فجوة قصيرة بين أي طلبين (يجمع الطلبات المتزامنة)
+// وتوقف كل شيء تلقائياً عند تحديد المعدّل — طلبات الفيديو المتتابعة كانت تُقاطع الصور معها
+let _gate = Promise.resolve();
+let _gatePause = 0;
+function ghGate(fn) {
+  const run = _gate.then(async () => {
+    const wait = _gatePause - Date.now();
+    if (wait > 0) await sleep(wait);
+    _gatePause = Date.now() + 130;
+    return fn();
+  });
+  _gate = run.catch(() => {});
+  return run;
+}
+function ghPause(ms) { _gatePause = Math.max(_gatePause, Date.now() + ms); }
+
 // جلب بايتات ملف كاملة بطلب واحد: Accept: application/vnd.github.raw يعيد البايتات
-// مباشرة (حتى ~100MB) — بلا metadata مزدوجة، ومع إعادة محاولة تلقائية على تحديد
-// المعدّل الثانوي (403/429) أو انقطاع الشبكة — لأن التحميل المتتابع للقطع قد يُقاطع
-// فجأة عند قطعة متوسطة إذا لم ننتظر بين الطلبات.
+// مباشرة (حتى ~100MB) — ومع إعادة محاولة تلقائية على تحديد المعدّل الثانوي (403/429)
 async function getFileBytes(path, branch) {
   const c = ctx();
   const url = `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${path}?ref=${encodeURIComponent(branch)}`;
   let lastErr;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const r = await fetch(url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.raw' } });
+      const r = await ghGate(() => fetch(url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.raw' } }));
       if (r.status === 401) { logout(); throw new Error('PAT مرفوض — سجّل الدخول من جديد'); }
       if (r.status === 403 || r.status === 429) {
         const ra = Math.min(Number(r.headers.get('retry-after') || 0) || 0, 30);
-        lastErr = new Error(`حد المعدّل من GitHub (${r.status}) — أعد المحاولة`);
-        await sleep(ra > 0 ? ra * 1000 : 1500 * (attempt + 1));
+        const waitMs = ra > 0 ? ra * 1000 : 2000 * (attempt + 1);
+        ghPause(waitMs); // أوقف كل الطلبات لا هذا فقط
+        lastErr = new Error(`حد معدّل GitHub مؤقتاً — أعيد المحاولة (${Math.round(waitMs / 1000)}ث)...`);
+        await sleep(waitMs);
         continue;
       }
       if (!r.ok) throw new Error(`فشل تحميل الملف الخام (GitHub ${r.status})`);
