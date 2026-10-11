@@ -77,16 +77,18 @@ setInterval(() => {
 }, 15 * 60 * 1000);
 
 // ---------- الثيم (الوحيد المسموح محلياً) ----------
-function initTheme() {
-  const t = LS.getItem('gj_theme') || 'light';
+function applyTheme(t) {
   document.documentElement.dataset.theme = t;
+  LS.setItem('gj_theme', t);
   $('btn-theme').textContent = t === 'dark' ? '☀️' : '🌙';
+  // مزامنة لون شريط المتصفح/التطبيق المثبّت مع الثيم الحالي
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t === 'dark' ? '#171310' : '#f6f1e7');
+}
+function initTheme() {
+  applyTheme(LS.getItem('gj_theme') || 'light');
 }
 $('btn-theme').onclick = () => {
-  const cur = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = cur;
-  LS.setItem('gj_theme', cur);
-  $('btn-theme').textContent = cur === 'dark' ? '☀️' : '🌙';
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
 };
 
 // زر تثبيت PWA (يظهر فقط عندما يقرر المتصفح أن التطبيق قابل للتثبيت)
@@ -745,6 +747,21 @@ async function existsPath(path, branch) {
 async function putPath(path, u8, branch, msg) {
   await gh(path, { method: 'PUT', body: JSON.stringify({ message: msg || `journal: add ${path}`, content: b64e(u8), branch }) });
 }
+// حذف ملف من الريبو عبر contents API (يحتاج sha من GET أولاً) — الملف غير موجود يُتخطى بصمت
+async function delPath(path, branch) {
+  const j = await gh(`${path}?ref=${encodeURIComponent(branch)}`);
+  await gh(path, { method: 'DELETE', body: JSON.stringify({ message: `journal: delete ${path}`, sha: j.sha, branch }) });
+}
+// جمع كل مسارات ملفات اليومية (حزمة + مرفقات + قطع مجزّأة) — كي تُحذف من الريبو كلها
+function entryFilePaths(e) {
+  const paths = [];
+  if (e.bundle?.path) paths.push(e.bundle.path);
+  for (const a of e.attachments || []) {
+    if (a.chunked && a.parts?.length) paths.push(...a.parts);
+    else if (a.path) paths.push(a.path);
+  }
+  return [...new Set(paths)];
+}
 // p: {path, src, kind, mime, thumb, tw, th, dur, note, compNote} + rawU8 — يعيد وصف المرفق
 async function uploadPayload(p, rawU8, c, prog, idx, total) {
   const tag = total > 1 ? `${idx}/${total}: ` : '';
@@ -1157,10 +1174,26 @@ function renderEntries() {
   $('entries').querySelectorAll('[data-all]').forEach(b => b.onclick = () => loadAllEntry(b.dataset.all));
   $('entries').querySelectorAll('[data-dl]').forEach(b => b.onclick = () => downloadEntry(b.dataset.dl));
   $('entries').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-    if (!confirm('حذف هذه اليومية؟ (يبقى ملف الوسائط في الريبو)')) return;
-    MEM.entries = MEM.entries.filter(x => x.id !== b.dataset.del);
-    try { await persistEntries('journal: delete entry'); renderAll(); }
-    catch (e) { alert('خطأ: ' + e.message); }
+    const id = b.dataset.del;
+    const it = MEM.entries.find(x => x.id === id);
+    if (!it) return;
+    const paths = entryFilePaths(it);
+    const extra = paths.length ? ` وسيُحذف كل ملفاته (${paths.length} ملف) من الريبو` : '';
+    if (!confirm(`حذف هذه اليومية نهائياً من الريبو؟${extra} — لا يمكن التراجع`)) return;
+    b.disabled = true;
+    try {
+      const c = ctx();
+      // حذف ملفات الوسائط من الريبو أولاً (إن فشل ملف نكمل الباقي ثم نُبقي السجل)
+      const failed = [];
+      for (const p of paths) {
+        try { await delPath(p, c.branch); }
+        catch (e) { if (!/404/.test(e.message || '')) failed.push(p); }
+      }
+      MEM.entries = MEM.entries.filter(x => x.id !== id);
+      await persistEntries('journal: delete entry');
+      renderAll();
+      if (failed.length) alert(`حُذفت اليومية، لكن تعذّر حذف ${failed.length} ملف من الريبو (حاول حذفها يدوياً):\n` + failed.join('\n'));
+    } catch (e) { alert('خطأ: ' + e.message); b.disabled = false; }
   });
 }
 

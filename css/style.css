@@ -1,8 +1,10 @@
 :root{
+  color-scheme: light dark;
   --bg:#f6f1e7; --card:#fffdf8; --ink:#2b2118; --muted:#8a7a68;
   --primary:#6d4c2f; --primary-ink:#fff; --border:#e7dccb; --danger:#b3261e;
 }
 [data-theme="dark"]{
+  color-scheme: dark;
   --bg:#171310; --card:#221c17; --ink:#f0e6d8; --muted:#a89886;
   --primary:#d9a066; --primary-ink:#1d1410; --border:#3a2f26;
 }
