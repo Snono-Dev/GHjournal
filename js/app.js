@@ -250,25 +250,42 @@ async function gh(path, opts = {}) {
   return res.json();
 }
 
-// جلب بايتات ملف كاملة: حقل content في الـ API قد يأتي ناقصاً/فارغاً للملفات الكبيرة
-// (والناقص يُفشل فك التشفير بخطأ "too small"). عند النقص نستخدم نفس API مع
-// Accept: application/vnd.github.raw الذي يعيد البايتات مباشرة — وليس download_url
-// (الذي يذهب إلى raw.githubusercontent.com ويفشل CORS مع هيدر Authorization → "failed to fetch")
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// جلب بايتات ملف كاملة بطلب واحد: Accept: application/vnd.github.raw يعيد البايتات
+// مباشرة (حتى ~100MB) — بلا metadata مزدوجة، ومع إعادة محاولة تلقائية على تحديد
+// المعدّل الثانوي (403/429) أو انقطاع الشبكة — لأن التحميل المتتابع للقطع قد يُقاطع
+// فجأة عند قطعة متوسطة إذا لم ننتظر بين الطلبات.
 async function getFileBytes(path, branch) {
-  const j = await gh(`${path}?ref=${encodeURIComponent(branch)}`);
-  if (j.content && j.encoding === 'base64') {
-    try {
-      const u8 = b64d(j.content);
-      if (u8.length === j.size) return u8;
-    } catch {}
-  }
   const c = ctx();
   const url = `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${path}?ref=${encodeURIComponent(branch)}`;
-  const r = await fetch(url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.raw' } });
-  if (!r.ok) throw new Error(`فشل تحميل الملف الخام (GitHub ${r.status})`);
-  const buf = new Uint8Array(await r.arrayBuffer());
-  if (j.size && buf.length !== j.size) throw new Error(`الملف ناقص من الخادم (وصل ${buf.length} من ${j.size}) — أعد المحاولة`);
-  return buf;
+  let lastErr;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const r = await fetch(url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.raw' } });
+      if (r.status === 401) { logout(); throw new Error('PAT مرفوض — سجّل الدخول من جديد'); }
+      if (r.status === 403 || r.status === 429) {
+        const ra = Math.min(Number(r.headers.get('retry-after') || 0) || 0, 30);
+        lastErr = new Error(`حد المعدّل من GitHub (${r.status}) — أعد المحاولة`);
+        await sleep(ra > 0 ? ra * 1000 : 1500 * (attempt + 1));
+        continue;
+      }
+      if (!r.ok) throw new Error(`فشل تحميل الملف الخام (GitHub ${r.status})`);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      const cl = Number(r.headers.get('content-length') || 0);
+      if (cl && buf.length !== cl) {
+        lastErr = new Error(`وصل جزء ناقص (${buf.length} من ${cl}) — أعد المحاولة`);
+        await sleep(900 * (attempt + 1));
+        continue;
+      }
+      return buf;
+    } catch (err) {
+      if (/PAT مرفوض|فشل تحميل/.test(err.message || '')) throw err;
+      lastErr = err;
+      await sleep(900 * (attempt + 1));
+    }
+  }
+  throw lastErr || new Error('تعذّر تحميل الملف');
 }
 
 const safeName = (n) => String(n || 'file').replace(/[^\w.\-\u0600-\u06FF]+/g, '_').slice(0, 80) || 'file';
@@ -1020,7 +1037,10 @@ async function downloadEntry(id) {
           inner[safeName(a.name)] = new Uint8Array(await (await fetch(cached)).arrayBuffer());
         } else if (a.chunked && a.parts) {
           const chunks = [];
-          for (const pp of a.parts) chunks.push(await decBytes(await getFileBytes(pp, c.branch)));
+          for (let i = 0; i < a.parts.length; i++) {
+            chunks.push(await decBytes(await getFileBytes(a.parts[i], c.branch)));
+            if (i < a.parts.length - 1) await sleep(200);
+          }
           const total = chunks.reduce((s, x) => s + x.length, 0);
           const all = new Uint8Array(total);
           let off = 0;
@@ -1175,6 +1195,7 @@ async function openCard(card) {
           for (let i = 0; i < parts.length; i++) {
             if (meta) meta.textContent = `⏳ تحميل قطعة ${i + 1}/${parts.length}...`;
             chunks.push(await decBytes(await getFileBytes(parts[i], c.branch)));
+            if (i < parts.length - 1) await sleep(200); // توقف قصير بين القطع — يمنع قطع GitHub المعدّل الثانوي
           }
           const total = chunks.reduce((s, x) => s + x.length, 0);
           const all = new Uint8Array(total);
