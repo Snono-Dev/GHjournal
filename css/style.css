@@ -55,6 +55,8 @@ button.danger-outline{border-color:var(--danger);color:var(--danger);background:
 .pend-row{display:flex;flex-direction:column;gap:6px;border:1px solid var(--border);border-radius:10px;padding:8px;margin:6px 0;background:var(--bg)}
 .pend-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .pend-row input{background:var(--card)}
+#entry-card.drag-over{outline:2px dashed var(--primary);outline-offset:-6px}
+#att-count{font-size:12px;color:var(--muted)}
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
 .chip{background:var(--bg);border:1px solid var(--border);border-radius:20px;padding:4px 10px;font-size:12px}
 .footer{text-align:center;padding:18px;font-size:13px}

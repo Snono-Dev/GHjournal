@@ -8,7 +8,7 @@ const SS = localStorage;
 // كل بيانات الدخول محفوظة محلياً بشكل دائم (لا تُمسح بإغلاق المتصفح، فقط بزر خروج). لا شيء آخر يُخزن.
 const S = { owner: 'gj_s_owner', repo: 'gj_s_repo', branch: 'gj_s_branch', token: 'gj_s_token', pwd: 'gj_s_pwd' };
 
-let MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null };
+let MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null, loaded: false };
 
 // الرفع لا يستمر بعد إغلاق المتصفح (لا شيء يعمل بعد موت الصفحة) — لذا:
 // 1) نحذّر من إغلاق/تحديث التبويب أثناء الرفع. 2) إعادة الحفظ تُكمل من حيث توقفت (تتخطى المرفوع).
@@ -88,6 +88,25 @@ $('btn-theme').onclick = () => {
   LS.setItem('gj_theme', cur);
   $('btn-theme').textContent = cur === 'dark' ? '☀️' : '🌙';
 };
+
+// زر تثبيت PWA (يظهر فقط عندما يقرر المتصفح أن التطبيق قابل للتثبيت)
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const b = $('btn-install');
+  if (b) b.classList.remove('hidden');
+});
+{
+  const bi = $('btn-install');
+  if (bi) bi.onclick = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    try { await deferredPrompt.userChoice; } catch {}
+    deferredPrompt = null;
+    bi.classList.add('hidden');
+  };
+}
 
 // ---------- الدخول: PAT بصلاحية كتابة على ريبو محدد ----------
 async function validateWritePat(owner, repo, token) {
@@ -208,7 +227,7 @@ $('btn-login').onclick = async () => {
 function logout() {
   try { MEM.blobs.forEach(u => { try { URL.revokeObjectURL(u); } catch {} }); } catch {}
   [S.owner, S.repo, S.branch, S.token, S.pwd].forEach(k => SS.removeItem(k));
-  MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null };
+  MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null, loaded: false };
   location.reload();
 }
 $('btn-logout').onclick = logout;
@@ -246,7 +265,7 @@ function fileToBase64(file) {
     r.readAsArrayBuffer(file);
   });
 }
-const safeName = (n) => n.replace(/[^\w.\-]+/g, '_').slice(0, 80) || 'file';
+const safeName = (n) => String(n || 'file').replace(/[^\w.\-\u0600-\u06FF]+/g, '_').slice(0, 80) || 'file';
 
 // ---------- التشفير الكامل (AES-GCM + PBKDF2) ----------
 // الملح محفوظ في data/crypto.json داخل الريبو (علني، وهذا آمن)، والمفتاح يُشتق من كلمة السر المحفوظة محلياً.
@@ -311,7 +330,7 @@ async function decBytes(blob) {
 }
 
 // ---------- ضغط الصور قبل التشفير ----------
-// الصور: تصغير لأقصى 1920px + JPEG بجودة 0.82 (أو WebP إن دعمه المتصفح). الفيديو/الصوت يرفعان كما هما (ضغطهما يتطلب ffmpeg وهو ثقيل على المتصفح).
+// الصور: تصغير لأقصى 1920px + JPEG بجودة 0.82. الفيديو الكبير (>10MB): إعادة ترميز لـ720p. الصوت الكبير (>8MB): إعادة ترميز منخفضة. الكل تلقائي.
 function loadImageEl(blob) {
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(blob);
@@ -334,8 +353,102 @@ async function compressImage(file) {
     const type = 'image/jpeg';
     const blob = await new Promise(r => cv.toBlob(r, type, 0.82));
     if (!blob || blob.size >= file.size) return { blob: file, compressed: false };
-    return { blob: new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type }), compressed: true };
+    return { blob: new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type }), compressed: true, ext: '.jpg' };
   } catch { return { blob: file, compressed: false }; }
+}
+
+// ---------- ضغط الفيديو والصوت تلقائياً (ترميز داخلي — بلا مكتبات ولا ffmpeg) ----------
+// الطريقة: تشغيل الملف محلياً وإعادة تسجيله عبر MediaRecorder (فيديو 720p + صوت منخفض).
+// يعمل بسرعة التشغيل (فيديو دقيقتين ≈ دقيقتان) مع نسبة تقدم. عند الفشل يُرفع الأصل كما هو.
+function pickMime(cands) {
+  try {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
+    return cands.find(c => { try { return MediaRecorder.isTypeSupported(c); } catch { return false; } }) || '';
+  } catch { return ''; }
+}
+function loadMediaEl(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const el = document.createElement('video'); // عنصر فيديو يشغّل الصوت أيضاً لالتقاط مساره
+    el.muted = true; el.playsInline = true; el.preload = 'auto'; el.src = url;
+    const timer = setTimeout(() => reject(new Error('timeout')), 25000);
+    el.onloadedmetadata = () => { clearTimeout(timer); resolve({ el, url }); };
+    el.onerror = () => { clearTimeout(timer); URL.revokeObjectURL(url); reject(new Error('bad-media')); };
+  });
+}
+async function transcodeMedia(file, opt, prog, label) {
+  // opt: {video:bool, W,H,vbps,abps,mimes}
+  let url = null, actx = null, raf = 0, drawing = false;
+  try {
+    const got = await loadMediaEl(file);
+    const v = got.el; url = got.url;
+    const dur = v.duration;
+    if (!dur || !isFinite(dur) || dur <= 0) throw new Error('no-duration');
+    if (dur > 20 * 60) throw new Error('too-long'); // أطول من 20 دقيقة: المعالجة أطول من المعقول
+    const mime = pickMime(opt.mimes);
+    if (!mime) throw new Error('no-recorder');
+    const ext = mime.includes('mp4') ? '.mp4' : '.webm';
+    const tracks = [];
+    if (opt.video) {
+      const canvas = document.createElement('canvas');
+      canvas.width = opt.W; canvas.height = opt.H;
+      const g = canvas.getContext('2d');
+      drawing = true;
+      const draw = () => { if (!drawing) return; try { g.drawImage(v, 0, 0, opt.W, opt.H); } catch {} raf = requestAnimationFrame(draw); };
+      draw();
+      tracks.push(...canvas.captureStream(30).getVideoTracks());
+    }
+    try {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') { try { await actx.resume(); } catch {} }
+      const src = actx.createMediaElementSource(v);
+      const dst = actx.createMediaStreamDestination();
+      src.connect(dst); // الصوت يُلتقط هنا (كتم العنصر لا يمنع الالتقاط)
+      tracks.push(...dst.stream.getAudioTracks());
+    } catch {}
+    if (!tracks.length) throw new Error('no-tracks');
+    const rec = new MediaRecorder(new MediaStream(tracks), { mimeType: mime, ...(opt.vbps ? { videoBitsPerSecond: opt.vbps } : {}), ...(opt.abps ? { audioBitsPerSecond: opt.abps } : {}) });
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    const finished = new Promise((res, rej) => { rec.onerror = () => rej(new Error('rec')); rec.onstop = res; });
+    const onTime = () => { try { prog(`${label} ضغط تلقائي... ${Math.min(99, Math.round((v.currentTime / dur) * 100))}% ⏳ (لا تغلق الصفحة)`); } catch {} };
+    v.addEventListener('timeupdate', onTime);
+    rec.start(1000);
+    await v.play();
+    await new Promise((res) => { v.onended = res; v.onerror = res; });
+    drawing = false; try { cancelAnimationFrame(raf); } catch {}
+    try { if (rec.state !== 'inactive') rec.stop(); } catch {}
+    await finished;
+    try { actx && actx.close(); } catch {}
+    URL.revokeObjectURL(url); url = null;
+    const type = mime.split(';')[0];
+    const out = new File([new Blob(chunks, { type })], (file.name || 'media').replace(/\.\w+$/, '') + ext, { type });
+    if (!out.size || out.size >= file.size) return { blob: file, compressed: false };
+    return { blob: out, compressed: true, ext, note: ` (ضُغط تلقائياً من ${(file.size / 1048576).toFixed(1)} إلى ${(out.size / 1048576).toFixed(1)}MB)` };
+  } catch {
+    drawing = false;
+    try { cancelAnimationFrame(raf); } catch {}
+    try { actx && actx.close(); } catch {}
+    if (url) { try { URL.revokeObjectURL(url); } catch {} }
+    return { blob: file, compressed: false };
+  }
+}
+async function compressVideoAuto(file, prog, label) {
+  let probe = null;
+  try {
+    const got = await loadMediaEl(file);
+    probe = { w: got.el.videoWidth || 1280, h: got.el.videoHeight || 720, dur: got.el.duration || 0 };
+    URL.revokeObjectURL(got.url);
+  } catch { return { blob: file, compressed: false }; }
+  if (!probe.dur || !isFinite(probe.dur)) return { blob: file, compressed: false };
+  const sc = Math.min(1, 1280 / Math.max(probe.w, probe.h));
+  const W = Math.max(2, Math.round(probe.w * sc / 2) * 2), H = Math.max(2, Math.round(probe.h * sc / 2) * 2);
+  const targetBytes = Math.min(file.size * 0.5, 25 * 1048576);
+  const vbps = Math.max(400000, Math.min(2500000, Math.floor((targetBytes * 8) / probe.dur)));
+  return transcodeMedia(file, { video: true, W, H, vbps, abps: 64000, mimes: ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'] }, prog, label);
+}
+async function compressAudioAuto(file, prog, label) {
+  return transcodeMedia(file, { video: false, abps: 96000, mimes: ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'] }, prog, label);
 }
 
 // ---------- مصغّرات العرض (بدون تحميل الملف الكامل) ----------
@@ -437,6 +550,7 @@ async function loadEntries() {
     if (String(e.message).includes('404')) { MEM.entries = []; MEM.sha = null; setConn(true); }
     else { setConn(false); throw e; }
   }
+  MEM.loaded = true;
   renderAll();
 }
 
@@ -453,14 +567,40 @@ async function persistEntries(msg) {
   MEM.sha = j.content.sha;
 }
 
-$('f-files').onchange = () => {
-  for (const f of $('f-files').files) {
+function addFiles(list) {
+  for (const f of list) {
     MEM.pending.push({ uid: 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), file: f, name: f.name, note: '' });
   }
-  $('f-files').value = '';
   renderPending();
-};
+}
+$('f-files').onchange = () => { addFiles($('f-files').files); $('f-files').value = ''; };
+
+// أزرار رفع مخصصة وواضحة: كل زر يفتح الاختيار على نوعه مباشرة (خاصة الصوت 🔊)
+function pickAs(accept) {
+  const i = $('f-files');
+  i.accept = accept;
+  i.click();
+  setTimeout(() => { i.accept = 'image/*,video/*,audio/*'; }, 2000);
+}
+{
+  const pa = $('btn-pick-audio'), pi = $('btn-pick-image'), pv = $('btn-pick-video');
+  if (pa) pa.onclick = () => pickAs('audio/*');
+  if (pi) pi.onclick = () => pickAs('image/*');
+  if (pv) pv.onclick = () => pickAs('video/*');
+}
+
+// سحب وإفلات عدة ملفات دفعة واحدة (سطح المكتب) — على الهاتف: حدّد عدة عناصر من المعرض مباشرة
+{
+  const dz = $('entry-card');
+  if (dz) {
+    ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('drag-over'); }));
+    ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('drag-over'); }));
+    dz.addEventListener('drop', (e) => { if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
+  }
+}
 function renderPending() {
+  const ac = $('att-count');
+  if (ac) ac.textContent = MEM.pending.length ? `— المرفق الآن: ${MEM.pending.length} ملفات` : '';
   $('pending-files').innerHTML = MEM.pending.map((it, i) => {
     const f = it.file;
     return `<div class="pend-row">
@@ -481,16 +621,26 @@ async function prepareItems(items, date, prog) {
   for (const it of items) {
     fi++;
     const f = it.file;
-    const disp = ((it.name || f.name) + '').trim() || f.name;
+    let disp = ((it.name || f.name) + '').trim() || f.name;
     const kind = f.type.startsWith('image/') ? 'image' : f.type.startsWith('video/') ? 'video' : 'audio';
     let upFile = f, compNote = '';
     if (kind === 'image') {
       prog(`ضغط الصورة ${fi}/${items.length}... 🗜️`);
       const r = await compressImage(f);
       upFile = r.blob;
-      if (r.compressed) compNote = ` (ضُغطت من ${(f.size / 1048576).toFixed(1)} إلى ${(upFile.size / 1048576).toFixed(1)}MB)`;
+      if (r.compressed) { compNote = ` (ضُغطت من ${(f.size / 1048576).toFixed(1)} إلى ${(upFile.size / 1048576).toFixed(1)}MB)`; disp = disp.replace(/\.\w+$/, '') + '.jpg'; }
+    } else if (kind === 'video' && f.size > 10 * 1048576) {
+      // فيديو كبير: إعادة ترميز تلقائية لـ720p — أنت لا تفعل شيئاً
+      const r = await compressVideoAuto(f, prog, `🎬 ${fi}/${items.length}`);
+      upFile = r.blob;
+      if (r.compressed) { compNote = r.note || ''; if (r.ext) disp = disp.replace(/\.\w+$/, '') + r.ext; }
+    } else if (kind === 'audio' && f.size > 8 * 1048576) {
+      // صوت كبير: إعادة ترميز تلقائية منخفضة — أنت لا تفعل شيئاً
+      const r = await compressAudioAuto(f, prog, `🔊 ${fi}/${items.length}`);
+      upFile = r.blob;
+      if (r.compressed) { compNote = r.note || ''; if (r.ext) disp = disp.replace(/\.\w+$/, '') + r.ext; }
     }
-    if (upFile.size > 60 * 1048576) throw new Error(`الملف "${disp}" أكبر من 60MB${compNote} — قلل الجودة أو قسّم الفيديو.`);
+    if (upFile.size > 500 * 1048576) throw new Error(`الملف "${disp}" أكبر من 500MB — ذاكرة المتصفح لا تستوعبه. قسّمه لأجزاء أصغر.`);
     const bytes = new Uint8Array(await upFile.arrayBuffer());
     totalRaw += bytes.length;
     let thumb = null, tw = 0, th = 0, dur = 0;
@@ -510,8 +660,47 @@ async function prepareItems(items, date, prog) {
     } catch { /* المصغّر اختياري — يُعرض زر تحميل بدلاً منه */ }
     prepared.push({ src: disp, kind, mime: upFile.type || 'application/octet-stream', bytes, url: URL.createObjectURL(upFile), compNote, note: ((it.note || '') + '').trim(), thumb, tw, th, dur, path: `media/${date}/${Date.now()}_${fi}_${safeName(disp)}.enc` });
   }
-  if (totalRaw > 150 * 1048576) throw new Error('مجموع الملفات أكبر من 150MB — وزّعها على أكثر من يومية.');
+  if (totalRaw > 800 * 1048576) throw new Error('مجموع الملفات أكبر من 800MB — وزّعها على أكثر من يومية.');
   return prepared;
+}
+
+// ---------- الرفع المجمّع: ملف واحد أو مجزأ لقطع (للملفات الضخمة بلا حد من التطبيق) ----------
+// سقف GitHub الصلب: ~100MB للملف الواحد عبر API + ~1GB لحجم الموقع — لذلك الملفات الكبيرة
+// تُقسّم لقطع 20MB (كل قطعة مشفرة بـIV مستقل) وتُجمّع عند العرض. سقف الأمان الوحيد: 500MB لذاكرة الجهاز.
+const CHUNK = 20 * 1048576, SINGLE_MAX = 40 * 1048576;
+async function existsPath(path, branch) {
+  try { await gh(`${path}?ref=${encodeURIComponent(branch)}`); return true; }
+  catch (err) { if (String(err.message).includes('404')) return false; throw err; }
+}
+async function putPath(path, u8, branch, msg) {
+  await gh(path, { method: 'PUT', body: JSON.stringify({ message: msg || `journal: add ${path}`, content: b64e(u8), branch }) });
+}
+// p: {path, src, kind, mime, thumb, tw, th, dur, note, compNote} + rawU8 — يعيد وصف المرفق
+async function uploadPayload(p, rawU8, c, prog, idx, total) {
+  const tag = total > 1 ? `${idx}/${total}: ` : '';
+  const meta = { path: p.path, kind: p.kind, name: p.src, size: rawU8.length, enc: true, mime: p.mime, thumb: p.thumb, tw: p.tw, th: p.th, dur: p.dur, note: p.note };
+  if (rawU8.length <= SINGLE_MAX) {
+    if (await existsPath(p.path, c.branch)) {
+      prog(`تخطي ${tag}${p.src} (مرفوع سابقاً) ✅`);
+    } else {
+      prog(`تشفير ورفع ${tag}${p.src}${p.compNote || ''} 🔐`);
+      await putPath(p.path, await encBytes(rawU8), c.branch);
+    }
+    return meta;
+  }
+  const prefix = p.path.replace(/\.enc$/, '');
+  const n = Math.ceil(rawU8.length / CHUNK);
+  const parts = [];
+  for (let i = 0; i < n; i++) {
+    const pp = `${prefix}.part${String(i + 1).padStart(3, '0')}.enc`;
+    parts.push(pp);
+    if (await existsPath(pp, c.branch)) { prog(`تخطي قطعة ${i + 1}/${n} من ${p.src} ✅`); continue; }
+    prog(`رفع قطعة ${i + 1}/${n} من ${p.src}... 🧩`);
+    await putPath(pp, await encBytes(rawU8.subarray(i * CHUNK, Math.min(rawU8.length, (i + 1) * CHUNK))), c.branch, `journal: part ${i + 1}/${n} ${pp}`);
+  }
+  meta.chunked = true;
+  meta.parts = parts;
+  return meta;
 }
 
 // رفع المعدّ (يتخطى الموجود — للاستئناف) ويعيد بيانات المرفقات — مشترك بين المباشر والمزامنة
@@ -520,17 +709,7 @@ async function uploadPrepared(prepared, c, prog) {
   let ui = 0;
   for (const p of prepared) {
     ui++;
-    let exists = false;
-    try { await gh(`${p.path}?ref=${encodeURIComponent(c.branch)}`); exists = true; }
-    catch (err) { if (!String(err.message).includes('404')) throw err; }
-    if (exists) {
-      prog(`تخطي ${ui}/${prepared.length}: ${p.src} (مرفوع سابقاً) ✅`);
-    } else {
-      prog(`تشفير ورفع ${ui}/${prepared.length}: ${p.src}${p.compNote} 🔐`);
-      const encU8 = await encBytes(p.bytes);
-      await gh(p.path, { method: 'PUT', body: JSON.stringify({ message: `journal: add ${p.path}`, content: b64e(encU8), branch: c.branch }) });
-    }
-    atts.push({ path: p.path, kind: p.kind, name: p.src, size: p.bytes.length, enc: true, mime: p.mime, thumb: p.thumb, tw: p.tw, th: p.th, dur: p.dur, note: p.note });
+    atts.push(await uploadPayload(p, p.bytes, c, prog, ui, prepared.length));
     cacheBlob(p.path, p.url); // مؤقت فقط — يُزال من الذاكرة فور نجاح الحفظ
   }
   return atts;
@@ -548,7 +727,7 @@ $('btn-save-entry').onclick = async () => {
   const title = $('f-title').value.trim(), text = $('f-text').value.trim();
   const date = $('f-date').value || todayISO();
   if (!title && !text && MEM.pending.length === 0 && !MEM.blobs.has('__rec')) return alert('اكتب شيئاً أو أرفق ملفاً أولاً');
-  if (MEM.pending.some(p => p.file.size > 60 * 1024 * 1024)) return alert('ملف أكبر من 60MB — قلل الجودة قبل الرفع.');
+  if (MEM.pending.some(p => p.file.size > 500 * 1024 * 1024)) return alert('ملف أكبر من 500MB — المتصفح لا يستطيع معالجته. قسّمه أولاً.');
   const prog = (m) => status($('save-status'), m);
   try {
     const c = ctx();
@@ -563,17 +742,15 @@ $('btn-save-entry').onclick = async () => {
     if (!navigator.onLine) {
       prog('لا إنترنت — تجهيز وحفظ محلياً... 📥');
       const prepared = await prepareItems(items, date, prog);
-      let encReady = false;
-      try { await getKey(); encReady = true; } catch { encReady = false; }
+      // تُخزن خاماً دائماً هنا (التشفير لحظة الرفع — يدعم التجزئة للضخم)، والمصغّرات جاهزة للعرض المحلي
       const files = [];
       for (const p of prepared) {
-        const payload = encReady ? await encBytes(p.bytes) : p.bytes;
-        files.push({ path: p.path, src: p.src, kind: p.kind, mime: p.mime, size: p.bytes.length, thumb: p.thumb, tw: p.tw, th: p.th, dur: p.dur, note: p.note, blob: new Blob([payload], { type: 'application/octet-stream' }), enc: encReady });
+        files.push({ path: p.path, src: p.src, kind: p.kind, mime: p.mime, size: p.bytes.length, thumb: p.thumb, tw: p.tw, th: p.th, dur: p.dur, note: p.note, blob: new Blob([p.bytes], { type: 'application/octet-stream' }), enc: false });
         try { URL.revokeObjectURL(p.url); } catch {}
       }
       await outboxPut({ id: 'q' + Date.now(), date, title: title || '(بدون عنوان)', text: text || '', mood, createdAt: new Date().toISOString(), files, status: 'pending', error: '' });
       clearEntryForm();
-      prog(encReady ? 'حُفظ مشفراً دون إنترنت 📥 — سيُرفع تلقائياً عند عودة الاتصال' : 'حُفظ محلياً 📥 (سيُشفّر عند الرفع) — سيُرفع تلقائياً عند عودة الاتصال');
+      prog('حُفظ محلياً 📥 — سيُشفّر ويُرفع تلقائياً عند عودة الاتصال');
       renderOutbox();
       return;
     }
@@ -665,6 +842,10 @@ async function syncOutbox(auto, onlyId) {
   if (!navigator.onLine) { renderOutbox(); return; }
   const c = ctx();
   if (!c.token || !c.pwd) return;
+  // المزامنة تكتب فوق entries.json فتحتاج sha محمّلاً — حمّل أولاً إن لزم
+  if (!MEM.loaded) {
+    try { await loadEntries(); } catch { renderOutbox(); return; }
+  }
   let items = await outboxList();
   if (onlyId) items = items.filter(x => x.id === onlyId);
   if (!items.length) { renderOutbox(); return; }
@@ -676,14 +857,11 @@ async function syncOutbox(auto, onlyId) {
     await outboxPut(it); renderOutbox();
     try {
       const atts = [];
+      let si = 0;
       for (const f of it.files) {
-        let payload = new Uint8Array(await f.blob.arrayBuffer());
-        if (!f.enc) payload = await encBytes(payload); // كانت خاماً — تُشفّر الآن
-        let exists = false;
-        try { await gh(`${f.path}?ref=${encodeURIComponent(c.branch)}`); exists = true; }
-        catch (err) { if (!String(err.message).includes('404')) throw err; }
-        if (!exists) await gh(f.path, { method: 'PUT', body: JSON.stringify({ message: `journal: add ${f.path}`, content: b64e(payload), branch: c.branch }) });
-        atts.push({ path: f.path, kind: f.kind, name: f.src, size: f.size, enc: true, mime: f.mime, thumb: f.thumb, tw: f.tw, th: f.th, dur: f.dur, note: f.note });
+        si++;
+        const raw = new Uint8Array(await f.blob.arrayBuffer());
+        atts.push(await uploadPayload({ path: f.path, src: f.src, kind: f.kind, mime: f.mime, thumb: f.thumb, tw: f.tw, th: f.th, dur: f.dur, note: f.note, compNote: '' }, raw, c, () => {}, si, it.files.length));
       }
       MEM.entries.unshift({ id: 'e' + Date.now(), date: it.date, title: it.title, text: it.text, mood: it.mood, createdAt: it.createdAt, attachments: atts });
       await persistEntries(`journal: sync offline ${it.date}`);
@@ -698,7 +876,23 @@ async function syncOutbox(auto, onlyId) {
   renderAll();
 }
 
-window.addEventListener('online', () => { renderOutbox(); syncOutbox(true); });
+// عودة الإنترنت: إن كنا داخل التطبيق دون بيانات (دخول دون إنترنت) حمّلها أولاً ثم زامن
+async function goOnlineRefresh() {
+  renderOutbox();
+  const c = ctx();
+  if (!c.token || !c.pwd) return;
+  if ($('screen-app').classList.contains('hidden')) return;
+  if (!MEM.loaded) {
+    try {
+      await validateWritePat(c.owner, c.repo, c.token);
+      await getKey();
+      showApp();
+      await loadEntries();
+    } catch { return; }
+  }
+  syncOutbox(true);
+}
+window.addEventListener('online', goOnlineRefresh);
 window.addEventListener('offline', () => renderOutbox());
 
 // ---------- عرض + تقويم + بحث ----------
@@ -748,14 +942,14 @@ function thumbCardHTML(o) {
   const badge = o.kind === 'video' ? '<span class="tc-play">▶</span>' : o.kind === 'audio' ? '<span class="tc-play">🔊</span>' : '<span class="tc-play">🔍</span>';
   const ref = o.t === 'zip'
     ? `data-t="zip" data-bp="${esc(o.bp)}" data-in="${esc(o.inner)}"`
-    : `data-t="file" data-path="${esc(o.path)}"`;
+    : `data-t="file" data-path="${esc(o.path)}"${o.parts ? ` data-parts="${encodeURIComponent(JSON.stringify(o.parts))}"` : ''}`;
   return `<button class="thumb-card" data-eid="${esc(o.eid)}" data-kind="${esc(o.kind)}" data-nm="${esc(o.name)}" data-mime="${esc(o.mime || '')}" data-note="${esc(o.note || '')}" ${ref}>${visual}${badge}<span class="tc-meta">${esc(o.name)}${sub ? ' • ' + esc(sub) : ''}</span>${o.note ? `<span class="tc-note">📝 ${esc(o.note)}</span>` : ''}</button>`;
 }
 
 function mediaTag(a, idx, eid) {
   const cached = getBlob(a.path);
   if (cached) return paintFullHTML(a.kind, a.name, cached, a.note);
-  return thumbCardHTML({ t: 'file', eid, kind: a.kind, name: a.name, mime: a.mime, size: a.size, dur: a.dur, thumb: a.thumb, path: a.path, note: a.note });
+  return thumbCardHTML({ t: 'file', eid, kind: a.kind, name: a.name, mime: a.mime, size: a.size, dur: a.dur, thumb: a.thumb, path: a.path, note: a.note, parts: a.parts });
 }
 
 function bundleTag(e, f, idx) {
@@ -793,6 +987,17 @@ async function downloadEntry(id) {
         const cached = getBlob(a.path);
         if (cached) {
           inner[safeName(a.name)] = new Uint8Array(await (await fetch(cached)).arrayBuffer());
+        } else if (a.chunked && a.parts) {
+          const chunks = [];
+          for (const pp of a.parts) {
+            const j = await gh(`${pp}?ref=${encodeURIComponent(c.branch)}`);
+            chunks.push(await decBytes(b64d(j.content)));
+          }
+          const total = chunks.reduce((s, x) => s + x.length, 0);
+          const all = new Uint8Array(total);
+          let off = 0;
+          for (const x of chunks) { all.set(x, off); off += x.length; }
+          inner[safeName(a.name)] = all;
         } else {
           const j = await gh(`${a.path}?ref=${encodeURIComponent(c.branch)}`);
           inner[safeName(a.name)] = await decBytes(b64d(j.content));
@@ -880,8 +1085,24 @@ async function openCard(card) {
       url = getBlob(path);
       if (!url) {
         const c = ctx();
-        const r = await gh(`${path}?ref=${encodeURIComponent(c.branch)}`);
-        url = URL.createObjectURL(new Blob([await decBytes(b64d(r.content))], { type: mime }));
+        const parts = card.dataset.parts ? JSON.parse(decodeURIComponent(card.dataset.parts)) : null;
+        if (parts && parts.length) {
+          // ملف مجزأ: جلب القطع بالتتابع مع تقدم ثم تجميعها وفك تشفيرها
+          const chunks = [];
+          for (let i = 0; i < parts.length; i++) {
+            if (meta) meta.textContent = `⏳ تحميل قطعة ${i + 1}/${parts.length}...`;
+            const r = await gh(`${parts[i]}?ref=${encodeURIComponent(c.branch)}`);
+            chunks.push(await decBytes(b64d(r.content)));
+          }
+          const total = chunks.reduce((s, x) => s + x.length, 0);
+          const all = new Uint8Array(total);
+          let off = 0;
+          for (const x of chunks) { all.set(x, off); off += x.length; }
+          url = URL.createObjectURL(new Blob([all], { type: mime }));
+        } else {
+          const r = await gh(`${path}?ref=${encodeURIComponent(c.branch)}`);
+          url = URL.createObjectURL(new Blob([await decBytes(b64d(r.content))], { type: mime }));
+        }
         cacheBlob(path, url);
       }
     }
@@ -933,12 +1154,27 @@ $('btn-stop-record').onclick = () => {
 };
 
 // ---------- بدء: استعد الدخول المحفوظ إن وجد، وإلا شاشة الدخول ----------
+// دون إنترنت وبيانات محفوظة: دخول لوضع عدم الاتصال (إضافة لقائمة الانتظار تعمل، العرض يحتاج شبكة).
+// مهم: انقطاع الشبكة لا يمسح المحفوظ أبداً — المسح فقط عند رفض المصادقة (401/403/404).
+function isAuthError(e) {
+  return /401|403|404|مرفوض|صلاحية|غير موجود/.test(String((e && e.message) || e || ''));
+}
+function clearCreds() { [S.owner, S.repo, S.branch, S.token, S.pwd].forEach(k => SS.removeItem(k)); MEM.key = null; }
+function enterOffline() {
+  showApp();
+  MEM.entries = []; MEM.sha = null; MEM.loaded = false;
+  const c = ctx();
+  $('sess-info').textContent = `📴 دون إنترنت — ${c.owner}/${c.repo} — يمكنك الإضافة وستُحفظ في قائمة الانتظار`;
+  renderAll();
+  renderOutbox();
+}
 (async function boot() {
   initTheme();
   // نظافة: امسح أي بقايا قديمة من النسخة السابقة (كلمة سر/توكن دائم)
   ['gj_lock_hash', 'gj_device_id', 'gj_bind', 'gj_settings', 'gj_token_local', 'gj_token'].forEach(k => LS.removeItem(k));
   const c = ctx();
   if (c.token && c.owner && c.repo && c.pwd) {
+    if (!navigator.onLine) { enterOffline(); return; }
     try {
       await validateWritePat(c.owner, c.repo, c.token);
       await getKey();
@@ -946,7 +1182,10 @@ $('btn-stop-record').onclick = () => {
       await loadEntries();
       syncOutbox(true);
       return;
-    } catch { /* فشل الاستعادة → شاشة الدخول (نمسح بيانات الدخول فقط ونُبقي الثيم) */ [S.owner, S.repo, S.branch, S.token, S.pwd].forEach(k => SS.removeItem(k)); MEM.key = null; }
+    } catch (e) {
+      if (!navigator.onLine || !isAuthError(e)) { enterOffline(); return; }
+      clearCreds();
+    }
   }
   showLogin();
 })();

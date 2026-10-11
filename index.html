@@ -5,12 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>دفتر يومياتي 📓</title>
 <link rel="stylesheet" href="css/style.css" />
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#6d4c2f" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="يومياتي" />
+<link rel="apple-touch-icon" href="icons/icon-180.png" />
 </head>
 <body>
 <header class="topbar">
   <h1>📓 دفتر يومياتي</h1>
   <div class="top-actions">
     <button id="btn-theme" title="وضع ليلي / نهاري">🌙</button>
+    <button id="btn-install" title="تثبيت التطبيق على الجهاز" class="hidden">📲</button>
     <button id="btn-logout" title="خروج (يمسح الدخول المحفوظ من هذا الجهاز)" class="hidden">🚪 خروج</button>
   </div>
 </header>
@@ -37,15 +45,18 @@
     <p class="warn hidden" id="pwd-warn">⚠️ نفس كلمة السر مطلوبة كل جلسة لفك التشفير. لا تُحفظ في أي مكان دائم، ولا يمكن استرجاع البيانات بدونها.</p>
     <p id="login-status" class="muted"></p>
     <ol class="help">
-      <li>أنشئ التوكن: GitHub → Settings → Developer settings → Fine-grained tokens → اختر <b>هذا الريبو فقط</b> → <b>Contents: Read and write</b>.</li>
+      <li>أنشئ التوكن: GitHub → Settings → Developer settings → Fine-grained tokens → اختر <b>ريبو البيانات الخاص فقط</b> → <b>Contents: Read and write</b>.</li>
       <li>لن تُقبل التوكنات بدون صلاحية كتابة (نرفض الدخول).</li>
       <li>⚠️ الدخول يُحفظ في <b>localStorage بهذا المتصفح</b> ويبقى بعد الإغلاق — استخدمه على <b>جهازك الخاص فقط</b> (بقفل شاشة)، ولمسحه اضغط <b>خروج</b>.</li>
       <li>العرض **مصغّرات بدون تحميل**: صور مصغرة وإطارات فيديو والمدة والحجم تُعرض فوراً — الضغط على المصغّر يجمّل **هذا الملف وحده فقط** (كل ملف مخزن مشفراً وحده)، وزر **▶ تحميل الكل** يجمّل مرفقات اليومية دفعة واحدة.</li>
       <li>🧠 **الذاكرة**: المرفوعات تُزال من الذاكرة فور نجاح الحفظ، والمفتوحة للعرض تُحذف تلقائياً **بعد 24 ساعة** (لا لحظياً) — وكل شيء في RAM فقط ويُمسح كله بالخروج أو إغلاق التبويب.</li>
       <li>⏳ **الرفع لا يستمر بعد إغلاق المتصفح** (مستحيل تقنياً) — لكن المغادرة أثناء الرفع تُظهر تحذيراً، وانقطاع الرفع لأي سبب ثم ضغط حفظ مجدداً **يُكمل من حيث توقف** (الملفات المرفوعة تُتخطى لا تُعاد).</li>
       <li>📥 **دون إنترنت**: الحفظ يعمل عادياً — تُحفظ اليومية في **قائمة انتظار على هذا الجهاز** (IndexedDB، وتبقى بعد إغلاق المتصفح) وتُرفع **تلقائياً** عند عودة الاتصال. ملاحظة صدق: ما حُفظ دون تشفير (أول استخدام دون اتصال سابق) يبقى خاماً على جهازك حتى يُرفع.</li>
+      <li>📲 **تثبيت كتطبيق (PWA)**: من متصفح الهاتف افتح القائمة ← تثبيت/إضافة للشاشة الرئيسية (أو زر 📲 إن ظهر) — يعمل بملء الشاشة ودون إنترنت للكتابة والحفظ المحلي.</li>
       <li>✏️ كل ملف مرفق له **اسم عرض وملاحظة** يُكتبان من صفحة الرفع ويظهران مع المصغّر والعرض الكامل.</li>
-      <li>ملاحظة صدق: ZIP لا يصغّر الصور والفيديو كثيراً (هي مضغوطة أصلاً) — التوفير الحقيقي من ضغط الصور والحزم في ملف واحد. RAR/7z لا يمكن إنشاؤهما داخل المتصفح، وZIP يفتح في كل الأنظمة.</li>
+      <li>🧩 **الملفات الضخمة بلا حد من التطبيق**: الكبير يُقسّم تلقائياً لقطع مشفرة ويُجمّع عند العرض (حتى ~500MB لحدود ذاكرة المتصفح وGitHub).</li>
+      <li>🗜️ **الضغط تلقائي بالكامل**: الصور تُصغّر، والفيديو الكبير يُعاد ترميزه لـ720p، والصوت الكبير يُضغط — أنت لا تفعل شيئاً (يظهر تقدم %). ملاحظة صدق: RAR/7z لا يمكن إنشاؤهما داخل المتصفح، وZIP (للتنزيل) يفتح في كل الأنظمة.</li>
+      <li>🔊 **رفع الصوت واضح**: زر 🔊 مخصص للصوت (و🖼️ للصور و🎬 للفيديو)، وضغط الصوت الكبير بجودة عالية للحفاظ على الوضوح.</li>
     </ol>
   </section>
 
@@ -64,7 +75,7 @@
       <div id="outbox-list"></div>
     </section>
 
-    <section class="card">
+    <section class="card" id="entry-card">
       <h2>✍️ يومية جديدة</h2>
       <div class="grid2">
         <label>التاريخ<input type="date" id="f-date" /></label>
@@ -81,12 +92,15 @@
       </div>
       <label>العنوان<input id="f-title" placeholder="عنوان اليوم..." /></label>
       <label>ملاحظات<textarea id="f-text" rows="4" placeholder="اكتب يومياتك هنا..."></textarea></label>
-      <label>إرفاق (صور تُضغط تلقائياً • كل ملف يُرفع مشفّراً وحده — فتح صورة لا يحمّل بقية ملفات اليوم)
+      <label>إرفاق — اختر <b>عدة ملفات معاً</b> دفعة واحدة (أو اسحبها وأفلتها هنا، أو كرر الإضافة على دفعات) <span id="att-count"></span>
         <input type="file" id="f-files" multiple accept="image/*,video/*,audio/*" />
       </label>
       <div class="row">
         <button id="btn-record">🎙️ تسجيل صوت</button>
         <button id="btn-stop-record" class="hidden" disabled>⏹ إيقاف (<span id="rec-time">0</span>ث)</button>
+        <button id="btn-pick-audio" title="رفع ملف صوتي من الجهاز">🔊 رفع صوت</button>
+        <button id="btn-pick-image" title="رفع صور من الجهاز">🖼️ رفع صور</button>
+        <button id="btn-pick-video" title="رفع فيديو من الجهاز">🎬 رفع فيديو</button>
         <audio id="rec-preview" controls class="hidden"></audio>
       </div>
       <div id="pending-files" class="chips"></div>
@@ -117,5 +131,10 @@
 
 <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 <script src="js/app.js"></script>
+<script>
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+</script>
 </body>
 </html>
