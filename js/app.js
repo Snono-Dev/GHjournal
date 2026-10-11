@@ -8,7 +8,7 @@ const SS = localStorage;
 // كل بيانات الدخول محفوظة محلياً بشكل دائم (لا تُمسح بإغلاق المتصفح، فقط بزر خروج). لا شيء آخر يُخزن.
 const S = { owner: 'gj_s_owner', repo: 'gj_s_repo', branch: 'gj_s_branch', token: 'gj_s_token', pwd: 'gj_s_pwd' };
 
-let MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null, loaded: false };
+let MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null, loaded: false, open: new Set(), editing: null };
 
 // الرفع لا يستمر بعد إغلاق المتصفح (لا شيء يعمل بعد موت الصفحة) — لذا:
 // 1) نحذّر من إغلاق/تحديث التبويب أثناء الرفع. 2) إعادة الحفظ تُكمل من حيث توقفت (تتخطى المرفوع).
@@ -227,7 +227,7 @@ $('btn-login').onclick = async () => {
 function logout() {
   try { MEM.blobs.forEach(u => { try { URL.revokeObjectURL(u); } catch {} }); } catch {}
   [S.owner, S.repo, S.branch, S.token, S.pwd].forEach(k => SS.removeItem(k));
-  MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null, loaded: false };
+  MEM = { entries: [], sha: null, blobs: new Map(), pending: [], calCursor: new Date(), filterDate: '', key: null, saltB64: null, loaded: false, open: new Set(), editing: null };
   location.reload();
 }
 $('btn-logout').onclick = logout;
@@ -250,28 +250,45 @@ async function gh(path, opts = {}) {
   return res.json();
 }
 
-// ---------- ملفات → Base64 ----------
-function fileToBase64(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => {
-      const bytes = new Uint8Array(r.result);
-      let bin = '';
-      const CH = 0x8000;
-      for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
-      res(btoa(bin));
-    };
-    r.onerror = rej;
-    r.readAsArrayBuffer(file);
-  });
+// جلب بايتات ملف كاملة: حقل content في الـ API قد يأتي ناقصاً/فارغاً للملفات الكبيرة
+// (والناقص يُفشل فك التشفير بخطأ "too small") — لذا نتحقق من الطول مقابل الحجم المعلن،
+// وعند أي نقص نحمّل الملف خاماً عبر download_url بالمصادقة
+async function getFileBytes(path, branch) {
+  const j = await gh(`${path}?ref=${encodeURIComponent(branch)}`);
+  if (j.content && j.encoding === 'base64') {
+    try {
+      const u8 = b64d(j.content);
+      if (u8.length === j.size) return u8;
+    } catch {}
+  }
+  const c = ctx();
+  const r = await fetch(j.download_url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/octet-stream' } });
+  if (!r.ok) throw new Error(`فشل تحميل الملف الخام (GitHub ${r.status})`);
+  const buf = new Uint8Array(await r.arrayBuffer());
+  if (j.size && buf.length !== j.size) throw new Error(`الملف ناقص من الخادم (وصل ${buf.length} من ${j.size}) — أعد المحاولة`);
+  return buf;
 }
+
 const safeName = (n) => String(n || 'file').replace(/[^\w.\-\u0600-\u06FF]+/g, '_').slice(0, 80) || 'file';
 
 // ---------- التشفير الكامل (AES-GCM + PBKDF2) ----------
 // الملح محفوظ في data/crypto.json داخل الريبو (علني، وهذا آمن)، والمفتاح يُشتق من كلمة السر المحفوظة محلياً.
 const ITER = 120000;
-function b64e(u8) { let s = ''; const CH = 0x8000; for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH)); return btoa(s); }
-function b64d(s) { return Uint8Array.from(atob(s.replace(/\n/g, '')), c => c.charCodeAt(0)); }
+function b64e(u8) {
+  // تجميع القطع في مصفوفة ودمج واحد — أسرع بكثير من += المتكرر للملفات الكبيرة
+  const parts = [];
+  const CH = 0x8000;
+  for (let i = 0; i < u8.length; i += CH) parts.push(String.fromCharCode.apply(null, u8.subarray(i, i + CH)));
+  return btoa(parts.join(''));
+}
+function b64d(s) {
+  // حلقة عادية أسرع من Uint8Array.from + دالة لكل بايت للملفات الكبيرة
+  const bin = atob(String(s).replace(/\n/g, ''));
+  const n = bin.length;
+  const u8 = new Uint8Array(n);
+  for (let i = 0; i < n; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
 
 async function ensureSalt() {
   if (MEM.saltB64) return MEM.saltB64;
@@ -441,14 +458,27 @@ async function compressVideoAuto(file, prog, label) {
     URL.revokeObjectURL(got.url);
   } catch { return { blob: file, compressed: false }; }
   if (!probe.dur || !isFinite(probe.dur)) return { blob: file, compressed: false };
-  const sc = Math.min(1, 1280 / Math.max(probe.w, probe.h));
+  const avgKbps = (file.size * 8) / probe.dur / 1000;
+  // صغير وفعال أصلاً؟ تخطَّ المعالجة كلها — الرفع المباشر أسرع ولا فائدة تُذكر من إعادة الترميز
+  if (file.size <= 25 * 1048576 && avgKbps <= 1200) return { blob: file, compressed: false };
+  // الطويل (>8 دقائق): 480p — نصف العمل تقريباً مقابل فرق جودة صغير على الهاتف
+  const maxD = probe.dur > 8 * 60 ? 854 : 1280;
+  const sc = Math.min(1, maxD / Math.max(probe.w, probe.h));
   const W = Math.max(2, Math.round(probe.w * sc / 2) * 2), H = Math.max(2, Math.round(probe.h * sc / 2) * 2);
   const targetBytes = Math.min(file.size * 0.5, 25 * 1048576);
   const vbps = Math.max(400000, Math.min(2500000, Math.floor((targetBytes * 8) / probe.dur)));
-  return transcodeMedia(file, { video: true, W, H, vbps, abps: 64000, mimes: ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'] }, prog, label);
+  // mp4/H.264 أولاً: ترميز عتاد (Hardware) في معظم الهواتف — أسرع بمرات من VP9 البرمجي
+  return transcodeMedia(file, { video: true, W, H, vbps, abps: 64000, mimes: ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'] }, prog, label);
 }
 async function compressAudioAuto(file, prog, label) {
-  return transcodeMedia(file, { video: false, abps: 96000, mimes: ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'] }, prog, label);
+  let dur = 0;
+  try { dur = await getMediaDuration(file); } catch {}
+  if (dur && isFinite(dur)) {
+    const avgKbps = (file.size * 8) / dur / 1000;
+    if (avgKbps <= 128) return { blob: file, compressed: false }; // مضغوط بكفاءة أصلاً — لا تضيّع وقت المعالجة
+    if (dur > 30 * 60) return { blob: file, compressed: false };   // أطول من 30 دقيقة: المعالجة أطول من المعقول
+  }
+  return transcodeMedia(file, { video: false, abps: 96000, mimes: ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'] }, prog, label);
 }
 
 // ---------- مصغّرات العرض (بدون تحميل الملف الكامل) ----------
@@ -561,7 +591,7 @@ async function persistEntries(msg) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(json)));
   const wrapper = JSON.stringify({ v: 1, alg: 'AES-GCM-256-PBKDF2', iv: b64e(iv), data: b64e(ct) });
-  const body = { message: msg, content: btoa(new TextEncoder().encode(wrapper).reduce((d, b) => d + String.fromCharCode(b), '')), branch: c.branch };
+  const body = { message: msg, content: b64e(new TextEncoder().encode(wrapper)), branch: c.branch };
   if (MEM.sha) body.sha = MEM.sha;
   const j = await gh('data/entries.json', { method: 'PUT', body: JSON.stringify(body) });
   MEM.sha = j.content.sha;
@@ -976,8 +1006,7 @@ async function downloadEntry(id) {
     if (e.bundle) {
       // الحزمة المفكوكة هي ZIP صالح جاهز للتنزيل مباشرة
       const c = ctx();
-      const j = await gh(`${e.bundle.path}?ref=${encodeURIComponent(c.branch)}`);
-      const zipBytes = await decBytes(b64d(j.content));
+      const zipBytes = await decBytes(await getFileBytes(e.bundle.path, c.branch));
       saveBlob(new Blob([zipBytes], { type: 'application/zip' }), `journal_${e.date}_${e.id}.zip`);
     } else if (e.attachments?.length) {
       if (typeof fflate === 'undefined' || !fflate.zipSync) return alert('مكتبة ZIP غير متاحة (CDN محجوب) — لا يمكن التجميع');
@@ -989,24 +1018,61 @@ async function downloadEntry(id) {
           inner[safeName(a.name)] = new Uint8Array(await (await fetch(cached)).arrayBuffer());
         } else if (a.chunked && a.parts) {
           const chunks = [];
-          for (const pp of a.parts) {
-            const j = await gh(`${pp}?ref=${encodeURIComponent(c.branch)}`);
-            chunks.push(await decBytes(b64d(j.content)));
-          }
+          for (const pp of a.parts) chunks.push(await decBytes(await getFileBytes(pp, c.branch)));
           const total = chunks.reduce((s, x) => s + x.length, 0);
           const all = new Uint8Array(total);
           let off = 0;
           for (const x of chunks) { all.set(x, off); off += x.length; }
           inner[safeName(a.name)] = all;
         } else {
-          const j = await gh(`${a.path}?ref=${encodeURIComponent(c.branch)}`);
-          inner[safeName(a.name)] = await decBytes(b64d(j.content));
+          inner[safeName(a.name)] = await decBytes(await getFileBytes(a.path, c.branch));
         }
       }
       saveBlob(new Blob([fflate.zipSync(inner, { level: 6 })], { type: 'application/zip' }), `journal_${e.date}_${e.id}.zip`);
     } else return alert('لا مرفقات في هذه اليومية');
     status($('save-status'), 'تم تنزيل ZIP ✅ (ملفات مفكوكة التشفير — احفظه في مكان آمن)');
   } catch (err) { alert('تعذّر التنزيل: ' + err.message); status($('save-status'), '', false); }
+}
+
+// ---------- اليوميات مغلقة (أكورديون): الضغط يفتح، وبداخلها تعديل وحذف ----------
+function entryCounts(e) {
+  const files = [...(e.bundle?.files || []), ...(e.attachments || [])];
+  const n = (k) => files.filter(f => f.kind === k).length;
+  const parts = [];
+  if (n('image')) parts.push(`🖼️${n('image')}`);
+  if (n('video')) parts.push(`🎬${n('video')}`);
+  if (n('audio')) parts.push(`🔊${n('audio')}`);
+  return parts.join(' ');
+}
+function entryHTML(e) {
+  const isOpen = MEM.open.has(e.id);
+  const counts = entryCounts(e);
+  const head = `<div class="entry-head" data-toggle="${e.id}">
+    <span class="chev">${isOpen ? '▼' : '▶'}</span>
+    <span class="eh-title">${esc(e.title)}</span>
+    <span class="meta">📅 ${esc(e.date)}${e.mood ? ' ' + esc(e.mood) : ''}${counts ? ' • ' + counts : ''}</span>
+  </div>`;
+  if (!isOpen) return head;
+  if (MEM.editing === e.id) return head + entryEditHTML(e);
+  return head + `<div class="entry-body">
+    <div class="emeta muted">أُنشئت: ${new Date(e.createdAt).toLocaleString('ar')}${e.updatedAt ? ' • عُدّلت: ' + new Date(e.updatedAt).toLocaleString('ar') : ''}</div>
+    <div>${esc(e.text).replace(/\n/g, '<br>')}</div>
+    ${e.bundle?.files?.length ? `<div class="atts">${e.bundle.files.map((f, j) => bundleTag(e, f, e.id + '_b' + j)).join('')}</div>` : ''}
+    ${e.attachments?.length ? `<div class="atts">${e.attachments.map((a, j) => mediaTag(a, e.id + '_' + j, e.id)).join('')}</div>` : ''}
+    <div class="row">${(e.bundle?.files?.length || e.attachments?.length) ? `<button data-all="${e.id}">▶ تحميل الكل</button>` : ''}<button data-edit="${e.id}">✏️ تعديل</button><button data-dl="${e.id}">⬇️ تنزيل ZIP</button><button data-del="${e.id}">🗑 حذف اليومية</button></div>
+  </div>`;
+}
+function entryEditHTML(e) {
+  const moods = ['', '😊 سعيد', '😐 عادي', '😔 حزين', '🤩 متحمس', '😴 متعب'];
+  return `<div class="entry-body">
+    <label>العنوان<input id="ee-title" value="${esc(e.title)}" /></label>
+    <div class="grid2">
+      <label>التاريخ<input id="ee-date" type="date" value="${esc(e.date)}" /></label>
+      <label>المزاج<select id="ee-mood">${moods.map(m => `<option value="${esc(m)}"${e.mood === m ? ' selected' : ''}>${m || '—'}</option>`).join('')}</select></label>
+    </div>
+    <label>ملاحظات<textarea id="ee-text" rows="4">${esc(e.text)}</textarea></label>
+    <div class="row"><button data-esave="${e.id}" class="primary">💾 حفظ التعديل</button><button data-ecancel>إلغاء</button></div>
+  </div>`;
 }
 
 function renderEntries() {
@@ -1018,15 +1084,31 @@ function renderEntries() {
   $('entries').innerHTML = list.length ? '' : '<p class="muted">لا توجد يوميات بعد. أضف أول يومية بالأعلى ✍️</p>';
   for (const e of list) {
     const div = document.createElement('div');
-    div.className = 'entry';
-    div.innerHTML = `<h3>${esc(e.title)}</h3>
-      <div class="meta">📅 ${esc(e.date)} ${esc(e.mood || '')} • ${new Date(e.createdAt).toLocaleString('ar')}</div>
-      <div>${esc(e.text).replace(/\n/g, '<br>')}</div>
-      ${e.bundle?.files?.length ? `<div class="atts">${e.bundle.files.map((f, j) => bundleTag(e, f, e.id + '_b' + j)).join('')}</div>` : ''}
-      ${e.attachments?.length ? `<div class="atts">${e.attachments.map((a, j) => mediaTag(a, e.id + '_' + j, e.id)).join('')}</div>` : ''}
-      <div class="row">${(e.bundle?.files?.length || e.attachments?.length) ? `<button data-all="${e.id}">▶ تحميل الكل</button>` : ''}<button data-dl="${e.id}">⬇️ تنزيل ZIP</button><button data-del="${e.id}">🗑 حذف</button></div>`;
+    div.className = 'entry' + (MEM.open.has(e.id) ? ' open' : '');
+    div.innerHTML = entryHTML(e);
     $('entries').appendChild(div);
   }
+  // الفتح/الطي + التعديل — المصغّرات والتحميل يعملان فقط لليوميات المفتوحة
+  $('entries').querySelectorAll('[data-toggle]').forEach(h => h.onclick = () => {
+    const id = h.dataset.toggle;
+    if (MEM.open.has(id)) { MEM.open.delete(id); if (MEM.editing === id) MEM.editing = null; }
+    else MEM.open.add(id);
+    renderEntries();
+  });
+  $('entries').querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { MEM.editing = b.dataset.edit; MEM.open.add(b.dataset.edit); renderEntries(); });
+  $('entries').querySelectorAll('[data-ecancel]').forEach(b => b.onclick = () => { MEM.editing = null; renderEntries(); });
+  $('entries').querySelectorAll('[data-esave]').forEach(b => b.onclick = async () => {
+    const it = MEM.entries.find(x => x.id === b.dataset.esave);
+    if (!it) return;
+    it.title = $('ee-title').value.trim() || '(بدون عنوان)';
+    it.date = $('ee-date').value || it.date;
+    it.mood = $('ee-mood').value;
+    it.text = $('ee-text').value.trim();
+    it.updatedAt = new Date().toISOString();
+    MEM.editing = null;
+    try { await persistEntries('journal: edit entry'); renderAll(); }
+    catch (err) { alert('خطأ: ' + err.message); }
+  });
   // لا تحميل تلقائي إطلاقاً — المصغّرات معروضة سلفاً، والضغط يجمّل الملف المطلوب وحده
   $('entries').querySelectorAll('.thumb-card').forEach(card => card.onclick = () => openCard(card));
   $('entries').querySelectorAll('[data-all]').forEach(b => b.onclick = () => loadAllEntry(b.dataset.all));
@@ -1048,8 +1130,7 @@ async function getUnzippedBundle(bpath) {
   if (!MEM.zipJobs[bpath]) {
     MEM.zipJobs[bpath] = (async () => {
       const c = ctx();
-      const r = await gh(`${bpath}?ref=${encodeURIComponent(c.branch)}`);
-      const map = fflate.unzipSync(await decBytes(b64d(r.content)));
+      const map = fflate.unzipSync(await decBytes(await getFileBytes(bpath, c.branch)));
       MEM.zipCache[bpath] = map;
       (MEM.zipAt = MEM.zipAt || new Map()).set(bpath, Date.now());
       return map;
@@ -1091,8 +1172,7 @@ async function openCard(card) {
           const chunks = [];
           for (let i = 0; i < parts.length; i++) {
             if (meta) meta.textContent = `⏳ تحميل قطعة ${i + 1}/${parts.length}...`;
-            const r = await gh(`${parts[i]}?ref=${encodeURIComponent(c.branch)}`);
-            chunks.push(await decBytes(b64d(r.content)));
+            chunks.push(await decBytes(await getFileBytes(parts[i], c.branch)));
           }
           const total = chunks.reduce((s, x) => s + x.length, 0);
           const all = new Uint8Array(total);
@@ -1100,8 +1180,7 @@ async function openCard(card) {
           for (const x of chunks) { all.set(x, off); off += x.length; }
           url = URL.createObjectURL(new Blob([all], { type: mime }));
         } else {
-          const r = await gh(`${path}?ref=${encodeURIComponent(c.branch)}`);
-          url = URL.createObjectURL(new Blob([await decBytes(b64d(r.content))], { type: mime }));
+          url = URL.createObjectURL(new Blob([await decBytes(await getFileBytes(path, c.branch))], { type: mime }));
         }
         cacheBlob(path, url);
       }
@@ -1111,8 +1190,10 @@ async function openCard(card) {
     card.replaceWith(tmp.firstChild);
   } catch (err) {
     card.disabled = false;
-    if (meta) meta.textContent = '⚠️ ' + (err.message || 'تعذّر التحميل') + ' — اضغط لإعادة المحاولة';
-    else card.title = String(err.message || err);
+    let msg = err.message || 'تعذّر التحميل';
+    if (/too small/i.test(msg)) msg = 'وصلت بيانات ناقصة من GitHub — أعد المحاولة (ملفاتك في الريبو سليمة، لم يُفقد شيء)';
+    if (meta) meta.textContent = '⚠️ ' + msg + ' — اضغط لإعادة المحاولة';
+    else card.title = String(msg);
     void orig;
   }
 }
