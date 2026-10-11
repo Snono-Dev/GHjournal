@@ -251,8 +251,9 @@ async function gh(path, opts = {}) {
 }
 
 // جلب بايتات ملف كاملة: حقل content في الـ API قد يأتي ناقصاً/فارغاً للملفات الكبيرة
-// (والناقص يُفشل فك التشفير بخطأ "too small") — لذا نتحقق من الطول مقابل الحجم المعلن،
-// وعند أي نقص نحمّل الملف خاماً عبر download_url بالمصادقة
+// (والناقص يُفشل فك التشفير بخطأ "too small"). عند النقص نستخدم نفس API مع
+// Accept: application/vnd.github.raw الذي يعيد البايتات مباشرة — وليس download_url
+// (الذي يذهب إلى raw.githubusercontent.com ويفشل CORS مع هيدر Authorization → "failed to fetch")
 async function getFileBytes(path, branch) {
   const j = await gh(`${path}?ref=${encodeURIComponent(branch)}`);
   if (j.content && j.encoding === 'base64') {
@@ -262,7 +263,8 @@ async function getFileBytes(path, branch) {
     } catch {}
   }
   const c = ctx();
-  const r = await fetch(j.download_url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/octet-stream' } });
+  const url = `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${path}?ref=${encodeURIComponent(branch)}`;
+  const r = await fetch(url, { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.raw' } });
   if (!r.ok) throw new Error(`فشل تحميل الملف الخام (GitHub ${r.status})`);
   const buf = new Uint8Array(await r.arrayBuffer());
   if (j.size && buf.length !== j.size) throw new Error(`الملف ناقص من الخادم (وصل ${buf.length} من ${j.size}) — أعد المحاولة`);
